@@ -7,6 +7,7 @@ use object::{
     Endianness, Object, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use std::fmt::format;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::{Deref, Range},
@@ -1406,7 +1407,9 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection<'_>> {
 
         let data_segment = segments
             .get(symbol.index as usize)
-            .context("Failed to find data segment")?;
+            .with_context(|| {
+                format!("Failed to find data segment index {:?}", symbol.index)
+            })?;
         let offset: usize =
             data_segment.range.end - data_segment.data.len() + (symbol.offset as usize);
         let range = offset..(offset + symbol.size as usize);
