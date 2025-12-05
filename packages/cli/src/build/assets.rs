@@ -32,7 +32,6 @@ use std::{
     io::{Cursor, Read, Seek, Write},
     path::{Path, PathBuf},
 };
-
 use crate::Result;
 use anyhow::{bail, Context};
 use const_serialize::{ConstVec, SerializeConst};
@@ -41,6 +40,8 @@ use manganis::BundledAsset;
 use object::{File, Object, ObjectSection, ObjectSymbol, ReadCache, ReadRef, Section, Symbol};
 use pdb::FallibleIterator;
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+use wasmparser::{Payload, TypeRef};
+use crate::build::find_passive_data_segment_offsets;
 
 /// Extract all manganis symbols and their sections from the given object file.
 fn manganis_symbols<'a, 'b, R: ReadRef<'a>>(
@@ -194,11 +195,44 @@ fn eval_walrus_global_expr(module: &walrus::Module, expr: &walrus::ConstExpr) ->
     }
 }
 
+fn is_wasm_multi_thread(file_contents: &[u8]) -> Result<bool> {
+    let mut parser = wasmparser::Parser::new(0);
+
+    for payload in parser.parse_all(file_contents) {
+        match payload? {
+            Payload::ImportSection(r) => {
+                for import in r {
+                    let import = import?;
+                    match import.ty {
+                        TypeRef::Memory(m) => {
+                            return Ok(m.shared);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Payload::MemorySection(r) => {
+                for memory_type in r {
+                    let memory_type = memory_type?;
+                    return Ok(memory_type.shared);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    bail!("Cannot find memory in WASM binary to tell whether it's shared")
+}
+
 /// Find the offsets of any manganis symbols in the wasm file.
 fn find_wasm_symbol_offsets<'a, R: ReadRef<'a>>(
     file_contents: &[u8],
     file: &File<'a, R>,
 ) -> Result<Vec<u64>> {
+    if is_wasm_multi_thread(file_contents)? {
+        return find_wasm_symbol_offsets_multi_threaded(file_contents);
+    }
+
     let Some(section) = file
         .sections()
         .find(|section| section.name() == Ok("<data>"))
@@ -286,6 +320,94 @@ fn find_wasm_symbol_offsets<'a, R: ReadRef<'a>>(
         let file_offset = data_start_offset + section_relative_address;
 
         offsets.push(file_offset);
+    }
+
+    Ok(offsets)
+}
+
+/// Find manganis symbol addresses in wasm binary.
+/// The multi-threaded handling is very different to single-threaded one.
+fn find_wasm_symbol_offsets_multi_threaded(file_contents: &[u8]) -> Result<Vec<u64>> {
+    // walrus doesn't give data segment offset in binary so use wasmparser to parse
+    let mut data_segment_offsets_in_binary : Vec<u64> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(file_contents) {
+        let payload = payload?;
+        match payload {
+            Payload::DataSection(r) => {
+                for data_segment in r.into_iter() {
+                    let data_segment = data_segment?;
+                    let offset = (data_segment.data.as_ptr() as u64)
+                        .checked_sub((file_contents.as_ptr() as u64))
+                        .context("subtraction underflow")?;
+                    data_segment_offsets_in_binary.push(offset);
+                }
+            }
+            _ => {}
+        }
+    };
+
+    // Parse the wasm file to find the globals
+    let module = walrus::Module::from_buffer(file_contents).unwrap();
+
+    let mut offsets = Vec::new();
+
+    let (rodata_segment_index, rodata_segment) = module.data
+        .iter()
+        .enumerate()
+        .filter(|(_index, data)| data.name.as_deref() == Some(".rodata"))
+        .next()
+        .context("Cannot find .rodata data segment")?;
+    // Note: in single-threaded wasm patch binary there is only .data,
+    // but the multithreaded patch binary has .rodata and .tdata and .data
+
+    let rodata_offset_in_binary = *data_segment_offsets_in_binary
+        .get(rodata_segment_index)
+        .context("Cannot get .rodata offset in wasm binary")?;
+
+    let rodata_offset_in_linear_memory = match rodata_segment.kind {
+        walrus::DataKind::Active { offset, .. } => {
+            bail!("Multi-threaded WASM should not have active data segment")
+        }
+        walrus::DataKind::Passive => {
+            let passive_data_section_offsets = find_passive_data_segment_offsets(&module)?;
+
+            passive_data_section_offsets
+                .get(&rodata_segment.id())
+                .context("Cannot get .rodata passive data segment offset in linear memory")?
+                .as_num()
+            // for base module, it uses absolute address
+            // for patch module, it uses address relative to __memory_base . the same applies to exported global
+        }
+    };
+
+    for export in module.exports.iter() {
+        if !looks_like_manganis_symbol(&export.name) {
+            continue;
+        }
+
+        let walrus::ExportItem::Global(global) = export.item else {
+            continue;
+        };
+
+        let walrus::GlobalKind::Local(pointer) = module.globals.get(global).kind else {
+            continue;
+        };
+
+        let Some(virtual_address) = eval_walrus_global_expr(&module, &pointer) else {
+            tracing::error!(
+                "Found __MANGANIS__ symbol {:?} in WASM file, but the global expression could not be evaluated",
+                export.name
+            );
+            continue;
+        };
+
+        let section_relative_address: u64 = ((virtual_address as i128)
+            - rodata_offset_in_linear_memory as i128)
+            .try_into()
+            .expect("Virtual address should be greater than or equal to section address");
+        let file_offset = rodata_offset_in_binary + section_relative_address;
+
+        offsets.push(file_offset as u64);
     }
 
     Ok(offsets)
