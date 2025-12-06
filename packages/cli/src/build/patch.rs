@@ -1,4 +1,5 @@
 use anyhow::Context;
+use dioxus_html::completions::CompleteWithBraces::mo;
 use itertools::Itertools;
 use object::{
     macho::{self},
@@ -1220,6 +1221,38 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
 
             make_indirect.push(new_func_id);
         }
+    }
+
+    let passive_segment_ids =  module.data.iter()
+        .filter_map(|data_segment| if matches!(data_segment.kind, DataKind::Passive) {
+            Some(data_segment.id())
+        } else {
+            None
+        } )
+        .collect::<Vec<_>>();
+
+    // prevent passive data segments from being GC-ed by wasm-bindgen,
+    // by adding a fake function and put it into indirect function table
+    if !passive_segment_ids.is_empty() {
+        let memory = module.memories.iter().next().expect("No memory");
+        let mut builder = FunctionBuilder::new(
+            &mut module.types,
+            &[],
+            &[]
+        );
+        let mut body =builder
+            .name("__workaround_wasmbindgen_gc_of_passive_data_segments".to_string())
+            .func_body();
+
+        for segment_id in passive_segment_ids {
+            body.i32_const(0);
+            body.i32_const(0);
+            body.i32_const(0);
+            body.memory_init(memory.id(), segment_id);
+        }
+
+        let new_func_id = module.funcs.add_local(builder.local_func(vec![]));
+        make_indirect.push(new_func_id);
     }
 
     for (name, index) in symbols.code_symbol_map.iter() {
