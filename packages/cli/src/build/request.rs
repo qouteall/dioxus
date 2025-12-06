@@ -4055,6 +4055,7 @@ impl BuildRequest {
             debug: self.debug_symbols,
             ..self.config.web.wasm_opt.clone()
         };
+        let disable_prune = ctx.mode == BuildMode::Fat;
 
         // Run wasm-bindgen. Some of the options are not "optimal" but will be fixed up by wasm-opt
         //
@@ -4075,6 +4076,7 @@ impl BuildRequest {
             .out_dir(&bindgen_outdir)
             .remove_name_section(!keep_names)
             .remove_producers_section(!keep_names)
+            .disable_prune(disable_prune)
             .run()
             .await
             .context("Failed to generate wasm-bindgen bindings")?;

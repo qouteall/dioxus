@@ -18,6 +18,7 @@ pub(crate) struct WasmBindgen {
     remove_name_section: bool,
     remove_producers_section: bool,
     keep_lld_exports: bool,
+    disable_prune: bool
 }
 
 impl WasmBindgen {
@@ -34,6 +35,7 @@ impl WasmBindgen {
             remove_name_section: false,
             remove_producers_section: false,
             keep_lld_exports: false,
+            disable_prune: false
         }
     }
 
@@ -98,6 +100,13 @@ impl WasmBindgen {
         }
     }
 
+    pub(crate) fn disable_prune(self, disable_prune: bool) -> Self {
+        Self {
+            disable_prune,
+            ..self
+        }
+    }
+
     /// Run the bindgen command with the current settings
     pub(crate) async fn run(&self) -> Result<std::process::Output> {
         let binary = self.get_binary_path()?;
@@ -131,6 +140,10 @@ impl WasmBindgen {
 
         if self.keep_lld_exports {
             args.push("--keep-lld-exports");
+        }
+
+        if self.disable_prune {
+            args.push("--disable-prune");
         }
 
         // Out name
