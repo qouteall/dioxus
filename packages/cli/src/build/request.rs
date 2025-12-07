@@ -401,6 +401,7 @@ pub(crate) struct BuildRequest {
     pub(crate) session_cache_dir: PathBuf,
     pub(crate) raw_json_diagnostics: bool,
     pub(crate) windows_subsystem: Option<String>,
+    pub(crate) disable_js_glue_shim: bool
 }
 
 /// dx can produce different "modes" of a build. A "regular" build is a "base" build. The Fat and Thin
@@ -1013,6 +1014,7 @@ impl BuildRequest {
             apple_team_id: args.apple_team_id.clone(),
             raw_json_diagnostics: args.raw_json_diagnostics,
             windows_subsystem: args.windows_subsystem.clone(),
+            disable_js_glue_shim: args.disable_js_glue_shim,
         })
     }
 
@@ -4202,7 +4204,9 @@ impl BuildRequest {
         }
 
         // Now that the wasm is registered as an asset, we can write the js glue shim
-        self.write_js_glue_shim(assets)?;
+        if !self.disable_js_glue_shim {
+            self.write_js_glue_shim(assets)?;
+        }
 
         if self.should_bundle_to_asset() {
             // Register the main.js with the asset system so it bundles in the snippets and optimizes
