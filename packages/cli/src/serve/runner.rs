@@ -430,6 +430,10 @@ impl AppServer {
                 // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
                 cached_file.most_recent = Some(new_contents);
 
+                // temporarily fix hotpatch not triggered for rust change
+                // TODO figure out why it works in another example
+                needs_full_rebuild = true;
+
                 // This assumes the two files are structured similarly. If they're not, we can't diff them
                 let Some(changed_rsx) = dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file) else {
                     needs_full_rebuild = true;
