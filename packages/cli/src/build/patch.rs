@@ -23,9 +23,7 @@ use walrus::{
     ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind,
     ImportKind, Module, ModuleConfig, TableId,
 };
-use wasmparser::{
-    BinaryReader, BinaryReaderError, Linking, LinkingSectionReader, Payload, SymbolInfo,
-};
+use wasmparser::{BinaryReader, BinaryReaderError, DefinedDataSymbol, Linking, LinkingSectionReader, Payload, SymbolInfo};
 
 type Result<T, E = PatchError> = std::result::Result<T, E>;
 
@@ -75,9 +73,15 @@ pub struct HotpatchModuleCache {
     pub old_bytes: Vec<u8>,
     pub old_exports: HashSet<String>,
     pub old_imports: HashSet<String>,
+    // it only has value in wasm multithreading
+    pub wasm_mt_tls_symbols: Option<HashMap<String, WasmTlsSymbol>>,
 
     // ... native stuff
     pub symbol_table: HashMap<String, CachedSymbol>,
+}
+
+pub struct WasmTlsSymbol {
+    defined_data_symbol: Option<DefinedDataSymbol>
 }
 
 pub struct CachedSymbol {
@@ -241,6 +245,26 @@ impl HotpatchModuleCache {
                     .map(|i| i.name.to_string())
                     .collect::<HashSet<_>>();
 
+                let is_multithreaded = module.memories.iter().next().context("no memory")?.shared;
+                let wasm_mt_tls_symbols: Option<HashMap<String, WasmTlsSymbol>> = if is_multithreaded {
+                    Some(
+                        symbols.symbols
+                            .iter()
+                            .filter_map(|s| {
+                                match s {
+                                    SymbolInfo::Data { flags, name, symbol: defined_symbol } => {
+                                        Some((name.to_string(), WasmTlsSymbol {
+                                            defined_data_symbol: *defined_symbol
+                                        }))
+                                    }
+                                    _ => None
+                                }
+                        }).collect()
+                    )
+                } else {
+                    None
+                };
+
                 HotpatchModuleCache {
                     path: original.to_path_buf(),
                     old_bytes: bytes,
@@ -248,6 +272,7 @@ impl HotpatchModuleCache {
                     old_exports,
                     old_imports,
                     old_wasm: module,
+                    wasm_mt_tls_symbols,
                     ..Default::default()
                 }
             }
@@ -1173,6 +1198,18 @@ pub fn create_undefined_symbol_stub(
     Ok(obj.write()?)
 }
 
+pub fn create_wasm_undefined_tls_symbol_stub(
+    cache: &HotpatchModuleCache,
+    tls_symbols: &HashMap<String, WasmTlsSymbol>
+) -> Result<Vec<u8>> {
+    let mut module = walrus::Module::with_config(walrus::ModuleConfig::new());
+
+
+    todo!();
+
+    Ok(module.emit_wasm())
+}
+
 /// Prepares the base module before running wasm-bindgen.
 ///
 /// This tries to work around how wasm-bindgen works by intelligently promoting non-wasm-bindgen functions
@@ -1468,6 +1505,7 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection<'_>> {
     })
 }
 
+// the type name is misleading. it's not limited to data sections
 struct RawDataSection<'a> {
     _data_range: Range<usize>,
     symbols: Vec<SymbolInfo<'a>>,

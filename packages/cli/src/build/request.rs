@@ -1744,6 +1744,15 @@ impl BuildRequest {
                     dylibs.push(self.frameworks_folder().join(path.file_name().unwrap()));
                 }
             }
+        } else {
+            if let Some(ref tls_symbols) = cache.wasm_mt_tls_symbols {
+                let stub_bytes = crate::build::create_wasm_undefined_tls_symbol_stub(cache, tls_symbols).expect("failed to create multithreaded wasm tls symbol stub");
+
+                // Currently we're dropping stub.o in the exe dir, but should probably just move to a tempfile?
+                let patch_file = self.main_exe().with_file_name("stub.o");
+                std::fs::write(&patch_file, stub_bytes)?;
+                object_files.push(patch_file);
+            }
         }
 
         // And now we can run the linker with our new args
