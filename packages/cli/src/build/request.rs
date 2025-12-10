@@ -1746,7 +1746,10 @@ impl BuildRequest {
             }
         } else {
             if let Some(ref tls_symbols) = cache.wasm_mt_tls_symbols {
-                let stub_bytes = crate::build::create_wasm_undefined_tls_symbol_stub(cache, tls_symbols).expect("failed to create multithreaded wasm tls symbol stub");
+                let stub_bytes = crate::build::create_wasm_undefined_tls_symbol_stub(
+                    cache, tls_symbols, &object_files
+                )
+                    .expect("failed to create multithreaded wasm tls symbol stub");
 
                 // Currently we're dropping stub.o in the exe dir, but should probably just move to a tempfile?
                 let patch_file = self.main_exe().with_file_name("stub.o");

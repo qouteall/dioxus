@@ -19,11 +19,9 @@ use std::{
 use subsecond_types::{AddressMap, JumpTable};
 use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
-use walrus::{
-    ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind,
-    ImportKind, Module, ModuleConfig, TableId,
-};
-use wasmparser::{BinaryReader, BinaryReaderError, DefinedDataSymbol, Linking, LinkingSectionReader, Payload, SymbolInfo};
+use walrus::{ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind, ImportKind, Module, ModuleConfig, RawCustomSection, TableId};
+use wasm_encoder::DataSymbolDefinition;
+use wasmparser::{BinaryReader, BinaryReaderError, DefinedDataSymbol, KnownCustom, Linking, LinkingSectionReader, Payload, SymbolInfo};
 
 type Result<T, E = PatchError> = std::result::Result<T, E>;
 
@@ -81,7 +79,8 @@ pub struct HotpatchModuleCache {
 }
 
 pub struct WasmTlsSymbol {
-    defined_data_symbol: Option<DefinedDataSymbol>
+    defined_data_symbol: Option<DefinedDataSymbol>,
+    flags: wasmparser::SymbolFlags
 }
 
 pub struct CachedSymbol {
@@ -254,7 +253,8 @@ impl HotpatchModuleCache {
                                 match s {
                                     SymbolInfo::Data { flags, name, symbol: defined_symbol } => {
                                         Some((name.to_string(), WasmTlsSymbol {
-                                            defined_data_symbol: *defined_symbol
+                                            defined_data_symbol: *defined_symbol,
+                                            flags: *flags
                                         }))
                                     }
                                     _ => None
@@ -1200,14 +1200,99 @@ pub fn create_undefined_symbol_stub(
 
 pub fn create_wasm_undefined_tls_symbol_stub(
     cache: &HotpatchModuleCache,
-    tls_symbols: &HashMap<String, WasmTlsSymbol>
+    tls_symbols: &HashMap<String, WasmTlsSymbol>,
+    object_file_paths: &Vec<PathBuf>
 ) -> Result<Vec<u8>> {
-    let mut module = walrus::Module::with_config(walrus::ModuleConfig::new());
+    let mut undefined_tls_symbol_names: HashSet<String> = HashSet::new();
+    let mut defined_tls_symbol_names: HashSet<String> = HashSet::new();
 
+    for object_file_path in object_file_paths {
+        let mut parser = wasmparser::Parser::new(0);
+        let bytes = std::fs::read(object_file_path)?;
+        for parse_res in parser.parse_all(&bytes) {
+            let payload = parse_res?;
+            match payload {
+                Payload::CustomSection(custom_section_reader) => {
+                    match custom_section_reader.as_known() {
+                        KnownCustom::Linking(linking_section_reader) => {
+                            for subsection in linking_section_reader.subsections() {
+                                let linking = subsection?;
+                                match linking {
+                                    Linking::SymbolTable(symbols) => {
+                                        for sym in symbols {
+                                            let sym = sym?;
+                                            match sym {
+                                                SymbolInfo::Data { flags, name, symbol } => {
+                                                    if flags & wasmparser::SymbolFlags::TLS {
+                                                        if symbol.is_some() {
+                                                            defined_tls_symbol_names.insert(name.to_string());
+                                                        } else {
+                                                            undefined_tls_symbol_names.insert(name.to_string());
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+    }
 
-    todo!();
+    undefined_tls_symbol_names = undefined_tls_symbol_names.difference(&defined_tls_symbol_names).collect();
 
-    Ok(module.emit_wasm())
+    let mut new_stub = wasm_encoder::Module::new();
+
+    let mut data_section = wasm_encoder::DataSection::new();
+    // add a fake unused data segment
+    data_section.passive(vec![]);
+
+    new_stub.section(&data_section);
+
+    let mut symbol_table_encoder = wasm_encoder::SymbolTable::new();
+
+    for undefined_tls_symbol_name in undefined_tls_symbol_names {
+        let original_symbol = tls_symbols.get(&undefined_tls_symbol_name);
+        if let Some(original_symbol) = original_symbol {
+            symbol_table_encoder.data(
+                original_symbol.flags.bits(),
+                &undefined_tls_symbol_name,
+                original_symbol.defined_data_symbol.map(|s| DataSymbolDefinition {
+                    index: s.index,
+                    offset: s.offset,
+                    size: s.size
+                })
+            );
+            if original_symbol.defined_data_symbol.is_none() {
+                tracing::warn!("TLS symbol not defined {:?}", undefined_tls_symbol_name);
+            }
+        } else {
+            tracing::warn!("Cannot find TLS symbol {:?}", undefined_tls_symbol_name);
+        };
+    }
+
+    let mut linking_section = wasm_encoder::LinkingSection::new();
+    linking_section.symbol_table(&symbol_table_encoder);
+
+    new_stub.section(&linking_section);
+
+    Ok(new_stub.finish())
 }
 
 /// Prepares the base module before running wasm-bindgen.
