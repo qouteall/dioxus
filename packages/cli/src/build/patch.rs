@@ -1223,7 +1223,7 @@ pub fn create_wasm_undefined_tls_symbol_stub(
                                             let sym = sym?;
                                             match sym {
                                                 SymbolInfo::Data { flags, name, symbol } => {
-                                                    if flags & wasmparser::SymbolFlags::TLS {
+                                                    if flags.contains(wasmparser::SymbolFlags::TLS) {
                                                         if symbol.is_some() {
                                                             defined_tls_symbol_names.insert(name.to_string());
                                                         } else {
@@ -1255,7 +1255,7 @@ pub fn create_wasm_undefined_tls_symbol_stub(
         }
     }
 
-    undefined_tls_symbol_names = undefined_tls_symbol_names.difference(&defined_tls_symbol_names).collect();
+    undefined_tls_symbol_names = undefined_tls_symbol_names.difference(&defined_tls_symbol_names).cloned().collect();
 
     let mut new_stub = wasm_encoder::Module::new();
 
@@ -1274,9 +1274,10 @@ pub fn create_wasm_undefined_tls_symbol_stub(
                 original_symbol.flags.bits(),
                 &undefined_tls_symbol_name,
                 original_symbol.defined_data_symbol.map(|s| DataSymbolDefinition {
-                    index: s.index,
-                    offset: s.offset,
-                    size: s.size
+                    // fake symbol
+                    index: 0, // data segment index
+                    offset: 0, // offset in data segment
+                    size: 1
                 })
             );
             if original_symbol.defined_data_symbol.is_none() {
