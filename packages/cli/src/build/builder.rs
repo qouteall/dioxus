@@ -689,7 +689,7 @@ impl AppBuilder {
             // If this is a new asset, insert it into the artifacts so we can track it when hot reloading
             original_artifacts.assets.insert_asset(*bundled);
 
-            let from = dunce::canonicalize(PathBuf::from(bundled.absolute_source_path()))?;
+            let from = dunce::canonicalize(PathBuf::from(bundled.absolute_source_path())).context("canonicalize")?;
 
             let to = asset_dir.join(bundled.bundled_path());
 
@@ -720,7 +720,7 @@ impl AppBuilder {
 
         tracing::debug!("Patching {} -> {}", original.display(), new.display());
 
-        let mut jump_table = self.build.create_jump_table(&new, cache)?;
+        let mut jump_table = self.build.create_jump_table(&new, cache).context("create_jump_table")?;
 
         // If it's android, we need to copy the assets to the device and then change the location of the patch
         if self.build.bundle == BundleFormat::Android {

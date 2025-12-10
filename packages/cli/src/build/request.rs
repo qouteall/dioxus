@@ -2390,7 +2390,7 @@ impl BuildRequest {
         let mut jump_table = match triple.operating_system {
             OperatingSystem::Windows => create_windows_jump_table(patch, cache)?,
             _ if triple.architecture == Architecture::Wasm32 => {
-                create_wasm_jump_table(patch, cache)?
+                create_wasm_jump_table(patch, cache).context("create_wasm_jump_table")?
             }
             _ => create_native_jump_table(patch, triple, cache)?,
         };

@@ -1,4 +1,5 @@
-use anyhow::Context;
+use crate::build::PatchError::InvalidModule;
+use anyhow::{bail, Context};
 use dioxus_html::completions::CompleteWithBraces::mo;
 use itertools::Itertools;
 use object::{
@@ -8,7 +9,10 @@ use object::{
     Endianness, Object, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use std::cmp::max;
 use std::fmt::format;
+use std::ops::Index;
+use std::string::ToString;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::{Deref, Range},
@@ -19,7 +23,8 @@ use std::{
 use subsecond_types::{AddressMap, JumpTable};
 use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
-use walrus::{ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind, ImportKind, Module, ModuleConfig, RawCustomSection, TableId};
+use walrus::ir::{Instr, Value};
+use walrus::{ConstExpr, DataId, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind, ImportKind, MemoryId, Module, ModuleConfig, RawCustomSection, TableId};
 use wasm_encoder::DataSymbolDefinition;
 use wasmparser::{BinaryReader, BinaryReaderError, DefinedDataSymbol, KnownCustom, Linking, LinkingSectionReader, Payload, SymbolInfo};
 
@@ -73,6 +78,7 @@ pub struct HotpatchModuleCache {
     pub old_imports: HashSet<String>,
     // it only has value in wasm multithreading
     pub wasm_mt_tls_symbols: Option<HashMap<String, WasmTlsSymbol>>,
+    pub wasm_passive_data_section_offsets: Option<HashMap<String, u64>>,
 
     // ... native stuff
     pub symbol_table: HashMap<String, CachedSymbol>,
@@ -265,6 +271,140 @@ impl HotpatchModuleCache {
                     None
                 };
 
+                let wasm_passive_data_section_offsets: Option<HashMap<String, u64>> = if is_multithreaded {
+                    // find the offsets of passive data sections by reading memory init function
+
+                    const WASM_INIT_MEMORY: &str = "__wasm_init_memory";
+
+                    let init_memory_func = module.funcs.iter()
+                        .find(|func| {
+                            func.name.as_deref() == Some(WASM_INIT_MEMORY)
+                        })
+                        .with_context(|| format!("Cannot find function {}", WASM_INIT_MEMORY))?;
+
+                    let init_memory_func = match init_memory_func.kind {
+                        FunctionKind::Local(ref local) => {local}
+                        _ => return Err(InvalidModule("__wasm_init_memory is not local function".to_string()))
+                    };
+
+                    struct MyVisitor {
+                        seen_consts: Vec<i64>,
+                        data_id_to_address: HashMap<DataId, u64>
+                    }
+
+                    // lld generates __wasm_init_memory function
+                    // https://github.com/llvm/llvm-project/blob/6f44be6f3e9fb6d373125b17b65bd6e09144b382/lld/wasm/Writer.cpp#L1328
+                    // an example:
+                    //  (func $__wasm_init_memory (type 0)
+                    //     block  ;; label = @1
+                    //       block  ;; label = @2
+                    //         block  ;; label = @3
+                    //           i32.const 2050412
+                    //           i32.const 0
+                    //           i32.const 1
+                    //           i32.atomic.rmw.cmpxchg
+                    //           br_table 0 (;@3;) 1 (;@2;) 2 (;@1;)
+                    //         end
+                    //         i32.const 1048576
+                    //         i32.const 1048576
+                    //         global.set $__tls_base.1
+                    //         i32.const 0
+                    //         i32.const 803
+                    //         memory.init $_ZN18serde_wasm_bindgen16static_str_to_js5CACHE29_$u7b$$u7b$constant$u7d$$u7d$28_$u7b$$u7b$closure$u7d$$u7d$23__RUST_STD_INTERNAL_VAL17h561b9da3af95b5d8E
+                    //         i32.const 1049408
+                    //         i32.const 0
+                    //         i32.const 995176
+                    //         memory.init $.Lanon.ea813ab7753d8c743b14e641d64050fe.0
+                    //         i32.const 2044592
+                    //         i32.const 0
+                    //         i32.const 912
+                    //         memory.init $_ZN24console_error_panic_hook8set_once8SET_HOOK17ha172e161697162f0E
+                    //         i32.const 2045504
+                    //         i32.const 0
+                    //         i32.const 4908
+                    //         memory.fill
+                    //         i32.const 2050412
+                    //         i32.const 2
+                    //         i32.atomic.store
+                    //         i32.const 2050412
+                    //         i32.const -1
+                    //         memory.atomic.notify
+                    //         drop
+                    //         br 1 (;@1;)
+                    //       end
+                    //       i32.const 2050412
+                    //       i32.const 1
+                    //       i64.const -1
+                    //       memory.atomic.wait32
+                    //       drop
+                    //     end
+                    //     data.drop $.Lanon.ea813ab7753d8c743b14e641d64050fe.0
+                    //     data.drop $_ZN24console_error_panic_hook8set_once8SET_HOOK17ha172e161697162f0E)
+
+                    // try to obtain the arguments to memory.init by the i32.const in front of it.
+                    // it doesn't work when it involves computations related to global
+                    impl <'a> walrus::ir::Visitor<'a> for MyVisitor {
+                        fn visit_instr(&mut self, instr: &'a walrus::ir::Instr, instr_loc: &'a walrus::InstrLocId) {
+                            match instr {
+                                Instr::Const(c) => {
+                                    match c.value {
+                                        Value::I32(value) => {
+                                            self.seen_consts.push(value as i64);
+                                        }
+                                        Value::I64(vaue) => {
+                                            self.seen_consts.push(vaue);
+                                        }
+                                        _ => {
+                                            // visited unrelated things, clear state
+                                            self.seen_consts.clear();
+                                        }
+                                    }
+                                }
+                                Instr::MemoryInit(memory_init) => {
+                                    if self.seen_consts.len() >= 3 {
+                                        // https://webassembly.github.io/spec/core/exec/instructions.html#exec-memory-init
+                                        let size = self.seen_consts.pop().unwrap();
+                                        let offset_in_segment = self.seen_consts.pop().unwrap();
+                                        let address = self.seen_consts.pop().unwrap();
+                                        self.data_id_to_address.insert(memory_init.data, address as u64);
+                                    } else {
+                                        tracing::warn!("Cannot get const values from memory.init instruction")
+                                    }
+                                }
+                                Instr::GlobalSet(_) => {
+                                    self.seen_consts.pop();
+                                }
+                                _ => {
+                                    // visited unrelated things, clear state
+                                    self.seen_consts.clear();
+                                }
+                            }
+                        }
+                    }
+
+                    let mut visitor = MyVisitor {
+                        seen_consts: Vec::new(),
+                        data_id_to_address: HashMap::new()
+                    };
+
+                    walrus::ir::dfs_in_order(&mut visitor, init_memory_func, init_memory_func.entry_block());
+
+                    let mut data_name_to_address: HashMap<String, u64> = HashMap::new();
+                    for data in module.data.iter() {
+                        if let Some(addr) = visitor.data_id_to_address.get(&data.id()) {
+                            if let Some(ref name ) = data.name {
+                                data_name_to_address.insert(name.clone(), *addr);
+                            } else {
+                                tracing::warn!("Data segment has no name {:?}", data);
+                            }
+                        }
+                    }
+
+                    Some(data_name_to_address)
+                } else {
+                    None
+                };
+
                 HotpatchModuleCache {
                     path: original.to_path_buf(),
                     old_bytes: bytes,
@@ -273,6 +413,7 @@ impl HotpatchModuleCache {
                     old_imports,
                     old_wasm: module,
                     wasm_mt_tls_symbols,
+                    wasm_passive_data_section_offsets,
                     ..Default::default()
                 }
             }
@@ -433,7 +574,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
     let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
 
-    let mut new = Module::from_buffer(&new_bytes)?;
+    let mut new = Module::from_buffer(&new_bytes).context("parsing module")?;
     let mut got_mems = vec![];
     let mut got_funcs = vec![];
     let mut wbg_funcs = vec![];
@@ -562,10 +703,14 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 ..
             } => idx as i32,
             _ => {
-                return Err(PatchError::InvalidModule(format!(
-                    "Data segment of invalid table: {:?}",
-                    data.kind
-                )));
+                let data_name = data.name.as_ref().with_context(|| format!("Passive data section has no name {:?}", data))?;
+                let offset = cache.wasm_passive_data_section_offsets
+                    .as_ref()
+                    .context("No wasm_passive_data_section_offsets")?
+                    .get(data_name)
+                    .with_context(|| format!("Cannot get passive data section offset of {:?}", data_name))?;
+
+                *offset as i32
             }
         };
 
@@ -1259,27 +1404,33 @@ pub fn create_wasm_undefined_tls_symbol_stub(
 
     let mut new_stub = wasm_encoder::Module::new();
 
-    let mut data_section = wasm_encoder::DataSection::new();
-    // add a fake unused data segment
-    data_section.passive(vec![]);
-
-    new_stub.section(&data_section);
+    let mut fake_data_segment_size: usize = 0;
 
     let mut symbol_table_encoder = wasm_encoder::SymbolTable::new();
 
     for undefined_tls_symbol_name in undefined_tls_symbol_names {
         let original_symbol = tls_symbols.get(&undefined_tls_symbol_name);
         if let Some(original_symbol) = original_symbol {
-            symbol_table_encoder.data(
-                original_symbol.flags.bits(),
-                &undefined_tls_symbol_name,
-                original_symbol.defined_data_symbol.map(|s| DataSymbolDefinition {
-                    // fake symbol
-                    index: 0, // data segment index
-                    offset: 0, // offset in data segment
-                    size: 1
-                })
-            );
+
+            if let Some(ref s) = original_symbol.defined_data_symbol {
+                symbol_table_encoder.data(
+                    original_symbol.flags.bits(),
+                    &undefined_tls_symbol_name,
+                    Some(DataSymbolDefinition {
+                        // the data segment index can be fake
+                        // but the offset and size need to be real
+                        // TLS address is __tls_base global added by a const offset
+                        // https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md#thread-local-storage
+                        index: 0, // data segment index
+                        offset: s.offset, // offset in data segment
+                        size: s.size, // size of TLS data in data segment
+                    })
+                );
+
+                // ensure the fake data segment is large enough
+                fake_data_segment_size = max(fake_data_segment_size, (s.offset + s.size) as usize);
+            }
+
             if original_symbol.defined_data_symbol.is_none() {
                 tracing::warn!("TLS symbol not defined {:?}", undefined_tls_symbol_name);
             }
@@ -1287,6 +1438,12 @@ pub fn create_wasm_undefined_tls_symbol_stub(
             tracing::warn!("Cannot find TLS symbol {:?}", undefined_tls_symbol_name);
         };
     }
+
+    // add a fake data segment, just to satisfy the linker, won't be used at runtime
+    let mut fake_data_section = wasm_encoder::DataSection::new();
+    fake_data_section.passive(vec![0u8; fake_data_segment_size]);
+
+    new_stub.section(&fake_data_section);
 
     let mut linking_section = wasm_encoder::LinkingSection::new();
     linking_section.symbol_table(&symbol_table_encoder);
