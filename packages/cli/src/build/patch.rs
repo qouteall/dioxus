@@ -9,6 +9,7 @@ use object::{
     Endianness, Object, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use std::borrow::Cow;
 use std::cmp::max;
 use std::fmt::format;
 use std::ops::Index;
@@ -25,7 +26,7 @@ use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
 use walrus::ir::{Instr, Value};
 use walrus::{ConstExpr, DataId, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind, ImportKind, MemoryId, Module, ModuleConfig, RawCustomSection, TableId};
-use wasm_encoder::DataSymbolDefinition;
+use wasm_encoder::{CustomSection, DataSymbolDefinition, Encode};
 use wasmparser::{BinaryReader, BinaryReaderError, DefinedDataSymbol, KnownCustom, Linking, LinkingSectionReader, Payload, SymbolInfo};
 
 type Result<T, E = PatchError> = std::result::Result<T, E>;
@@ -1408,11 +1409,14 @@ pub fn create_wasm_undefined_tls_symbol_stub(
 
     let mut symbol_table_encoder = wasm_encoder::SymbolTable::new();
 
+    let mut offset_size_name_tuples: Vec<(u32, u32, String)> = Vec::new();
+
     for undefined_tls_symbol_name in undefined_tls_symbol_names {
         let original_symbol = tls_symbols.get(&undefined_tls_symbol_name);
         if let Some(original_symbol) = original_symbol {
 
             if let Some(ref s) = original_symbol.defined_data_symbol {
+                assert!(original_symbol.flags.contains(wasmparser::SymbolFlags::TLS));
                 symbol_table_encoder.data(
                     original_symbol.flags.bits(),
                     &undefined_tls_symbol_name,
@@ -1426,6 +1430,7 @@ pub fn create_wasm_undefined_tls_symbol_stub(
                         size: s.size, // size of TLS data in data segment
                     })
                 );
+                offset_size_name_tuples.push((s.offset, s.size, undefined_tls_symbol_name.clone()));
 
                 // ensure the fake data segment is large enough
                 fake_data_segment_size = max(fake_data_segment_size, (s.offset + s.size) as usize);
@@ -1445,10 +1450,45 @@ pub fn create_wasm_undefined_tls_symbol_stub(
 
     new_stub.section(&fake_data_section);
 
-    let mut linking_section = wasm_encoder::LinkingSection::new();
-    linking_section.symbol_table(&symbol_table_encoder);
+    let mut linking_section_bytes: Vec<u8> = Vec::new();
 
-    new_stub.section(&linking_section);
+    // linking section version
+    <u32 as Encode>::encode(&2, &mut linking_section_bytes);
+
+    // encode symbol table
+    symbol_table_encoder.encode(&mut linking_section_bytes);
+
+    // encode segment info
+    // https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md#segment-info-subsection
+
+    // type of segment info
+    linking_section_bytes.push(5);
+    
+    let mut segment_info_bytes: Vec<u8> = Vec::new();
+
+    // segment info count
+    <u32 as Encode>::encode(&1, &mut segment_info_bytes);
+
+    // name_len and name_data
+    // .tdata to make it a TLS data segment
+    <str as Encode>::encode(&".tdata", &mut segment_info_bytes);
+
+    // alignment, probably doesn't matter as it's just used for satisfying the linker
+    <u32 as Encode>::encode(&1, &mut segment_info_bytes);
+
+    // flags, only flag is WASM_SEGMENT_FLAG_TLS which is 2
+    <u32 as Encode>::encode(&1, &mut segment_info_bytes);
+
+    // segment info size
+    <u32 as Encode>::encode(&(segment_info_bytes.len() as u32), &mut linking_section_bytes);
+
+    // segment info content
+    linking_section_bytes.extend(segment_info_bytes);
+
+    new_stub.section(&CustomSection {
+        name: "linking".into(),
+        data: Cow::Borrowed(&linking_section_bytes),
+    });
 
     Ok(new_stub.finish())
 }
