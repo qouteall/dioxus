@@ -1771,7 +1771,7 @@ impl BuildRequest {
         let mut out_args: Vec<OsString> = vec![];
         out_args.extend(object_files.iter().map(Into::into));
         out_args.extend(dylibs.iter().map(Into::into));
-        out_args.extend(self.thin_link_args(&args)?.iter().map(Into::into));
+        out_args.extend(self.thin_link_args(&args, ctx)?.iter().map(Into::into));
         out_args.extend(out_arg.iter().map(Into::into));
 
         if cfg!(windows) {
@@ -1850,7 +1850,7 @@ impl BuildRequest {
     ///
     /// This is basically just stripping away the rlibs and other libraries that will be satisfied
     /// by our stub step.
-    fn thin_link_args(&self, original_args: &[String]) -> Result<Vec<String>> {
+    fn thin_link_args(&self, original_args: &[String], ctx: &BuildContext) -> Result<Vec<String>> {
         let mut out_args = vec![];
 
         match self.linker_flavor() {
@@ -1888,6 +1888,16 @@ impl BuildRequest {
                     "--pie".to_string(),
                     "--experimental-pic".to_string(),
                 ]);
+
+                let is_multithreaded = match ctx.mode {
+                    BuildMode::Thin { ref cache, .. } => {
+                        cache.wasm_passive_data_section_offsets.is_some()
+                    }
+                    _ => false
+                };
+                if is_multithreaded {
+                    out_args.push("--shared-memory".to_string());
+                }
 
                 // retain exports so post-processing has hooks to work with
                 for (idx, arg) in original_args.iter().enumerate() {
