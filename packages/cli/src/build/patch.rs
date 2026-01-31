@@ -1,4 +1,5 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
+use dioxus_html::feBlend::format;
 use itertools::Itertools;
 use object::{
     macho::{self},
@@ -17,12 +18,17 @@ use std::{
 use subsecond_types::{AddressMap, JumpTable};
 use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
+use tracing::debug;
+use walrus::ir::{BinaryOp, Binop, Instr, Value};
 use walrus::{
-    ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind,
-    ImportKind, Module, ModuleConfig, TableId,
+    ConstExpr, DataId, DataKind, ElementItems, ElementKind, ExportItem, FunctionBuilder,
+    FunctionId, FunctionKind, GlobalId, GlobalKind, ImportKind, LocalId, MemoryId, Module,
+    ModuleConfig, RawCustomSection, TableId,
 };
+use wasm_encoder::{CustomSection, DataSymbolDefinition, Encode};
 use wasmparser::{
-    BinaryReader, BinaryReaderError, Linking, LinkingSectionReader, Payload, SymbolInfo,
+    BinaryReader, BinaryReaderError, DefinedDataSymbol, KnownCustom, Linking, LinkingSectionReader,
+    Payload, SymbolInfo,
 };
 
 type Result<T, E = PatchError> = std::result::Result<T, E>;
@@ -73,6 +79,7 @@ pub struct HotpatchModuleCache {
     pub old_bytes: Vec<u8>,
     pub old_exports: HashSet<String>,
     pub old_imports: HashSet<String>,
+    pub wasm_static_data_addr: HashMap<String, u64>,
 
     // ... native stuff
     pub symbol_table: HashMap<String, CachedSymbol>,
@@ -249,6 +256,51 @@ impl HotpatchModuleCache {
                     .map(|i| i.name.to_string())
                     .collect::<HashSet<_>>();
 
+                let mut data_segment_offsets_in_memory = Vec::new();
+                for data in module.data.iter() {
+                    data_segment_offsets_in_memory.push(match data.kind {
+                        DataKind::Active { offset, .. } => match offset {
+                            ConstExpr::Value(walrus::ir::Value::I32(v)) => v as u64,
+                            ConstExpr::Value(walrus::ir::Value::I64(v)) => v as u64,
+                            _ => {
+                                return Err(PatchError::InvalidModule(
+                                    "Invalid data segment offset".to_string(),
+                                ))
+                            }
+                        },
+                        DataKind::Passive => {
+                            return Err(PatchError::InvalidModule(
+                                "Wasm multithreading hotpatch not yet supported".to_string(),
+                            ));
+                        }
+                    });
+                }
+
+                let mut wasm_static_data_addr: HashMap<String, u64> = HashMap::new();
+                for symbol_info in &symbols.symbols {
+                    match symbol_info {
+                        SymbolInfo::Data {
+                            name,
+                            symbol: Some(s),
+                            ..
+                        } => {
+                            let data_segment_index = s.index;
+                            let offset_within_data_segment = s.offset;
+
+                            if data_segment_index as usize > data_segment_offsets_in_memory.len() {
+                                return Err(PatchError::InvalidModule(
+                                    "Invalid data segment index in symbol table".to_string(),
+                                ));
+                            }
+
+                            let offset = offset_within_data_segment as u64
+                                + data_segment_offsets_in_memory[data_segment_index as usize];
+                            wasm_static_data_addr.insert(name.to_string(), offset);
+                        }
+                        _ => {}
+                    }
+                }
+
                 HotpatchModuleCache {
                     path: original.to_path_buf(),
                     old_bytes: bytes,
@@ -256,6 +308,7 @@ impl HotpatchModuleCache {
                     old_exports,
                     old_imports,
                     old_wasm: module,
+                    wasm_static_data_addr,
                     ..Default::default()
                 }
             }
@@ -562,39 +615,15 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
     //
     // We simply use the name of the import as a key into the symbol table and then its offset into
     // its data segment as the value within the global.
-    for mem in got_mems {
-        let import = new.imports.get(mem);
-        let data_symbol_idx = *old_symbols
-            .data_symbol_map
-            .get(import.name.as_str())
-            .with_context(|| {
-                format!("Failed to find GOT.mem import by its name: {}", import.name)
-            })?;
-        let data_symbol = old_symbols
-            .data_symbols
-            .get(&data_symbol_idx)
-            .context("Failed to find data symbol by its index")?;
-        let data = old
-            .data
-            .iter()
-            .nth(data_symbol.which_data_segment)
-            .context("Missing data segment in the main module")?;
+    for import_id in got_mems {
+        let import = new.imports.get(import_id);
 
-        let offset = match data.kind {
-            DataKind::Active {
-                offset: ConstExpr::Value(walrus::ir::Value::I32(idx)),
-                ..
-            } => idx,
-            DataKind::Active {
-                offset: ConstExpr::Value(walrus::ir::Value::I64(idx)),
-                ..
-            } => idx as i32,
-            _ => {
-                return Err(PatchError::InvalidModule(format!(
-                    "Data segment of invalid table: {:?}",
-                    data.kind
-                )));
-            }
+        let name = &import.name;
+
+        let Some(address_at_runtime) = cache.wasm_static_data_addr.get(name) else {
+            return Err(PatchError::InvalidModule(
+                format!("Unknown data symbol {}", name).to_string(),
+            ));
         };
 
         let ImportKind::Global(global_id) = import.kind else {
@@ -605,10 +634,32 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
 
         // "satisfying" the import means removing it from the import table and replacing its target
         // value with a local global.
-        new.imports.delete(mem);
+        new.imports.delete(import_id);
         new.globals.get_mut(global_id).kind = walrus::GlobalKind::Local(ConstExpr::Value(
-            walrus::ir::Value::I32(offset + data_symbol.segment_offset as i32),
+            walrus::ir::Value::I32(*address_at_runtime as i32),
         ));
+    }
+
+    static GOT_DATA_INTERNAL: &str = "GOT.data.internal.";
+
+    let mut to_change_global: Vec<(GlobalId, u64)> = Vec::new();
+    for global in new.globals.iter() {
+        if let Some(name) = global.name.as_ref() {
+            if name.starts_with(GOT_DATA_INTERNAL) {
+                let data_symbol_name = &name[GOT_DATA_INTERNAL.len()..];
+                let Some(addr) = cache.wasm_static_data_addr.get(data_symbol_name) else {
+                    return Err(PatchError::InvalidModule(format!(
+                        "Cannot find address of data {}",
+                        data_symbol_name
+                    )));
+                };
+                to_change_global.push((global.id(), *addr));
+            }
+        }
+    }
+    for (global_id, addr) in to_change_global {
+        new.globals.get_mut(global_id).kind =
+            GlobalKind::Local(ConstExpr::Value(Value::I32(addr as i32)));
     }
 
     // wasm-bindgen has a limit on the number of exports a module can have, so we need to call the main
@@ -1524,6 +1575,7 @@ struct RawDataSection<'a> {
 struct DataSymbol {
     _index: usize,
     _range: Range<usize>,
+    /// offset within data segment
     segment_offset: usize,
     _symbol_size: usize,
     which_data_segment: usize,

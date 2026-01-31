@@ -354,6 +354,7 @@ use subsecond_types::JumpTable;
 use target_lexicon::{Architecture, OperatingSystem, Triple};
 use tempfile::TempDir;
 use tokio::{io::AsyncBufReadExt, process::Command};
+use tracing::debug;
 use uuid::Uuid;
 
 /// This struct is used to plan the build process.
@@ -1223,6 +1224,7 @@ impl BuildRequest {
 
         let mut cmd = self.build_command(&ctx.mode)?;
         tracing::debug!(dx_src = ?TraceSrc::Build, "Executing cargo for {} using {}", self.bundle, self.triple);
+        tracing::debug!(?cmd, envs=?cmd.as_std().get_envs());
 
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -3161,7 +3163,10 @@ impl BuildRequest {
         let mut jump_table = match triple.operating_system {
             OperatingSystem::Windows => create_windows_jump_table(patch, cache)?,
             _ if triple.architecture == Architecture::Wasm32 => {
-                create_wasm_jump_table(patch, cache)?
+                // keep the binary before mutating for debugging
+                std::fs::copy(patch, self.session_cache_dir.join("before_post_processing_patch.wasm"))?;
+
+                create_wasm_jump_table(patch, cache).context("create_wasm_jump_table")?
             }
             _ => create_native_jump_table(patch, triple, cache)?,
         };
@@ -3316,6 +3321,13 @@ impl BuildRequest {
                         .iter()
                         .map(|(k, v)| (k.as_ref(), v)),
                 );
+
+                // for compiler debugging
+                std::env::var("RUSTC_LOG").ok()
+                    .map(|rustc_log |{
+                        cmd.env("RUSTC_LOG", rustc_log);
+                    });
+
                 cmd.arg(format!("-Clinker={}", Workspace::path_to_dx()?.display()));
 
                 if self.is_wasm_or_wasi() {
@@ -3323,6 +3335,21 @@ impl BuildRequest {
                 }
 
                 cmd.envs(rustc_args.envs.iter().cloned());
+
+                // try to make global variable address stable
+                {
+                    // a hacky way to enable unstable flags without changing toolchain
+                    cmd.env("RUSTC_BOOTSTRAP", "1");
+
+                    // https://doc.rust-lang.org/beta/unstable-book/compiler-flags/default-visibility.html
+                    cmd.arg("-Zdefault-visibility=interposable");
+
+                    // https://doc.rust-lang.org/beta/unstable-book/compiler-flags/direct-access-external-data.html
+                    cmd.arg("-Zdirect-access-external-data=no");
+
+                    // added by me for testing
+                    cmd.arg("-Ztest-internal-data-reachable=yes");
+                }
 
                 Ok(cmd)
             }
@@ -5021,6 +5048,7 @@ impl BuildRequest {
         // Lift the internal functions to exports
         if ctx.mode == BuildMode::Fat {
             let unprocessed = std::fs::read(exe)?;
+            std::fs::copy(exe, self.session_cache_dir.join("before_pre_processing_base.wasm"))?;
             let all_exported_bytes = crate::build::prepare_wasm_base_module(&unprocessed)?;
             std::fs::write(exe, all_exported_bytes)?;
         }
